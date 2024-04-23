@@ -1,210 +1,158 @@
 import sys
+
+from jose import JWTError
+
 sys.path.append("..")
-
-import models
-from database import SessionLocal, engine
-
-from jose import jwt, JWTError
-from typing import Optional
-from datetime import datetime, timedelta
-from sqlalchemy.orm import Session
-from passlib.context import CryptContext
-
-from fastapi import Depends, HTTPException, status, APIRouter,Request,Form,Response
-from fastapi.security import OAuth2PasswordRequestForm, OAuth2PasswordBearer
-from fastapi.responses import HTMLResponse
+from fastapi import APIRouter, Request, Depends, Form, Response, HTTPException
+from fastapi.responses import HTMLResponse,RedirectResponse
 from fastapi.templating import Jinja2Templates
+from fastapi.security import OAuth2PasswordBearer
+from starlette import status
+from sqlalchemy.orm import Session
+from database import engine,SessionLocal
+from passlib.context import CryptContext
+from datetime import timedelta,datetime,timezone
+from pydantic import BaseModel
+import models
+import jwt
 
-from starlette.responses import RedirectResponse
 
 SECRET_KEY = "KlgH6AzYDeZeGwD288to79I3vTHT8wp7"
 ALGORITHM = "HS256"
 
-class LoginForm:
-    def __init__(self, request: Request):
-        self.request: Request = request
-        self.username: Optional[str] = None
-        self.password: Optional[str] = None
+# bcrypt 기본 설정
+bcrptpw = CryptContext(schemes=['bcrypt'],deprecated='auto')
 
-    async def create_oauth_form(self):
-        form = await self.request.form()
-        self.username = form.get("email")
-        self.password = form.get("password")
+# https://fastapi.tiangolo.com/tutorial/security/oauth2-jwt/
+# FASTPAI에서 만든 레퍼런스 코드 존재
 
-
-bcrypt_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-models.Base.metadata.create_all(bind=engine)
-
-oauth2_bearer = OAuth2PasswordBearer(tokenUrl="token")
-
-template = Jinja2Templates(directory='./templates/')
-
+# Fastapi Oauth2 패스워드 설정
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 router = APIRouter(
-    prefix="/auth",
-    tags=["auth"],
-    responses={401: {"user": "Not authorized"}}
+    prefix='/auth',
+    responses={404: {"description": "Not found"}}
 )
 
+templates = Jinja2Templates(directory='templates/')
 
-def get_db():
-    try:
+def get_db() :
+    try :
         db = SessionLocal()
         yield db
     finally:
         db.close()
 
+# 패스워드 bcrypt사용하여 hash
+def get_passwd_hash(password) :
+    return bcrptpw.hash(password)
 
-def get_password_hash(password):
-    return bcrypt_context.hash(password)
+# 패스워드와 hash된 패스워드 비교
+def check_verify_password(password,hashedpw):
+    return bcrptpw.verify(password,hashedpw)
 
-
-def verify_password(plain_password, hashed_password):
-    return bcrypt_context.verify(plain_password, hashed_password)
-
-
-def authenticate_user(username: str, password: str, db):
-    user = db.query(models.Users)\
-        .filter(models.Users.username == username)\
-        .first()
-
-    if not user: return False
-    if not verify_password(password, user.hashed_password):  return False
+# 유저인증 함수
+# 유저와 패스워드 동일한지 여부 판단
+def authenticate_user(username: str, password: str,db):
+    user = db.query(models.Users).filter(models.Users.username == username).first()
+    if not user: return None
+    if not check_verify_password(password, user.hashed_password):
+        return None
     return user
 
+# 액세스 토큰 JWT 인코딩으로 생성
+# time_expire 유효시간 설정
+# 시간 지날시 jwt.exceptions.ExpiredSignatureError: Signature has expired
+def create_access_token(data: dict,time_expire):
+    to_encode = data.copy()
+    expire = datetime.now(timezone.utc) + time_expire
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
 
-def create_access_token(username: str, user_id: int,
-                        expires_delta: Optional[timedelta] = None):
+# 로그인한 기록이 있다면 쿠키를 확인하여 이상여부 판단
 
-    encode = {"sub": username, "id": user_id}
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(minutes=15)
-    encode.update({"exp": expire})
-    return jwt.encode(encode, SECRET_KEY, algorithm=ALGORITHM)
-
-
-async def get_current_user(request : Request):
+async def get_current_user(request : Request,db) :
     try:
-        token = request.cookies.get("access_token")
-        if token is None: return None
+        # 'access_token'은 쿠키이름 가져오기
+        token = request.cookies.get('access_token')
+        if token is None : return None
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username: str = payload.get("sub")
-        user_id: int = payload.get("id")
-        if username is None or user_id is None:
-            logout(request)
-        return {"username": username, "id": user_id}
-    except JWTError:
-        raise HTTPException(status_code=404, detail="Not found")
-
-
-
-@router.post("/token")
-async def login_for_access_token(response : Response,
-                                 form_data : OAuth2PasswordRequestForm = Depends(),
-                                 db : Session=Depends(get_db)):
-    user = authenticate_user(form_data.username, form_data.password, db)
-    if not user: return False
-
-    token_expires = timedelta(minutes=60)
-    token = create_access_token(user.username,
-                                user.id,
-                                expires_delta=token_expires)
-    response.set_cookie(key="access_token", value=token, httponly=True)
-
-    return True
+        username: str = payload.get("username")
+        password: str = payload.get("password")
+        token_data = authenticate_user(username,password,db)
+        if token_data is None: return None
+        return token_data
+    # 시간 에러 발생시 logout 실행
+    except jwt.ExpiredSignatureError:
+        await logout(request)
+        return None
 
 @router.get('/')
-async def loginpage(request: Request) :
-    return_dict = {'request': request}
-    return template.TemplateResponse('login.html', context=return_dict)
+async def login_get_page(request:Request) :
+    context  = {'request' :request}
+    return templates.TemplateResponse('login.html',context)
+
 
 @router.post('/',response_class=HTMLResponse)
-async def loginpage(request: Request,db : Session = Depends(get_db)) :
-    try :
-        form = LoginForm(request)
-        await form.create_oauth_form()
-        response = RedirectResponse(url="/", status_code=status.HTTP_302_FOUND)
-
-        validate_user_cookie = await login_for_access_token(response=response,form_data=form, db=db)
-
-        if not validate_user_cookie:
-            msg = "Incorrect Username or Password"
-            return template.TemplateResponse("login.html", {"request": request, "msg": msg})
-        return response
-    except HTTPException:
-        msg = "Unknown Error"
-        return template.TemplateResponse("login.html", {"request": request, "msg": msg})
-
-
-@router.get("/logout")
-async def logout(request: Request):
-    msg = "Logout Successful"
-    response = template.TemplateResponse("login.html", {"request": request, "msg": msg})
-    response.delete_cookie(key="access_token")
+async def login_post_page(request:Request, db : Session=Depends(get_db),
+                    email : str = Form(...),password : str = Form(...)) :
+    
+    # 입력받은 정보가 로그인 문제없는지 체크
+    user= authenticate_user(email,password,db)
+    if user is None :
+        context = {'request': request,'msg':'This user does not exist.'}
+        return templates.TemplateResponse('login.html', context)
+    # 토큰 생성 및 쿠키설정
+    time_expire = timedelta(minutes=15)
+    access_token = create_access_token(data={"username": email,
+                                             'password':password},
+                                       time_expire=time_expire)
+    # Redirect로 넘길시 쿠키가 전달되지 않은 상황 발생
+    # FAST-API 공식문서에서도 직접반환으로 통해 쿠키생성 가능이라고 적혀있음
+    # https://fastapi.tiangolo.com/advanced/response-cookies/
+    response = RedirectResponse(url='/todos',status_code=status.HTTP_302_FOUND)
+    response.set_cookie(key="access_token",value=access_token,expires=time_expire,httponly=False)
     return response
 
-
 @router.get('/register')
-async def registerpage(request: Request) :
-    return_dict = {'request': request}
-    return template.TemplateResponse('register.html', context=return_dict)
+async def register_get_page(request:Request) :
+    context  = {'request' :request}
+    return templates.TemplateResponse('register.html',context)
 
 @router.post('/register',response_class=HTMLResponse)
-async def registerpage(request: Request,db : Session = Depends(get_db),
-                       email:str = Form(...),username:str = Form(...),
-                       firstname:str = Form(...),lastname:str = Form(...),
-                       password:str = Form(...),password2:str = Form(...)) :
-    validation1 = db.query(models.Users).filter(models.Users.username == username).first()
-    validation2 = db.query(models.Users).filter(models.Users.email == email).first()
-    if password != password2 or validation1 is not None or validation2 is not None:
+async def register_post_page(request:Request,db : Session=Depends(get_db),
+                             email: str = Form(...), username: str = Form(...),
+                             firstname:str=Form(...),lastname:str=Form(...),
+                             password:str=Form(...),password2=Form(...)) :
 
-        msg = "Invalid registration request"
-        return template.TemplateResponse("register.html", {"request": request, "msg": msg})
+    if password!=password2 :
+        context  = {'request' :request,'msg':'Password mismatch'}
+        return templates.TemplateResponse('register.html',context)
 
-    hash_pwd = get_password_hash(password)
-    newuser = models.Users(
-        email =email,
-        username = username,
-        first_name = firstname,
-        last_name = lastname,
-        hashed_password = hash_pwd,
-        is_active=True
+    validata= db.query(models.Users).filter(models.Users.email==email).first()
+    validata2 = db.query(models.Users).filter(models.Users.username==username).first()
+    if validata or validata2 :
+        context = {'request': request, 'msg': 'Duplicate ID or email.'}
+        return templates.TemplateResponse('register.html', context)
+    newuser= models.Users(
+        email = email,
+        username=username,
+        first_name=firstname,
+        last_name=lastname,
+        hashed_password=get_passwd_hash(password),
+        is_active=False
     )
     db.add(newuser)
     db.commit()
-    return_dict = {'request': request,'msg' : "User successfully created"}
-    return template.TemplateResponse('login.html', return_dict)
 
+    return RedirectResponse('/auth',status_code=status.HTTP_302_FOUND)
 
-#Exceptions
-def get_user_exception():
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-    return credentials_exception
-
-
-def token_exception():
-    token_exception_response = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Incorrect username or password",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-    return token_exception_response
-
-
-
-
-
-
-
-
-
-
-
-
+# 로그아웃 기능
+# 쿠키는 초기화가 되지 않음 하지만 기능적으로 문제없이 작동
+@router.get('/logout')
+async def logout(request:Request) :
+    request.cookies.clear()
+    response = RedirectResponse('/auth',status_code=status.HTTP_302_FOUND)
+    response.delete_cookie('access_token')
+    return response
